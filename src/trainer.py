@@ -1,5 +1,6 @@
-"""DeiT III training loop."""
+"""DeiT III training loop with persistent CSV metrics logging."""
 
+import csv
 import os
 import time
 
@@ -11,7 +12,13 @@ from timm.scheduler import CosineLRScheduler
 
 import wandb
 
-from .analysis import compute_l2_norms, plot_l2_distribution, visualize_attention_maps
+from .analysis import compute_l2_norms, plot_l2_distribution
+
+# All metric columns logged to CSV every epoch
+CSV_COLUMNS = [
+    'epoch', 'train_loss', 'val_loss', 'val_acc1', 'val_acc5', 'lr',
+    'l2_norm_mean', 'l2_norm_std', 'l2_outlier_ratio', 'epoch_time_s',
+]
 
 
 class Trainer:
@@ -56,6 +63,24 @@ class Trainer:
         self.scaler = GradScaler('cuda', enabled=self.use_amp)
         self.start_epoch = 0
 
+        # CSV metrics log
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        self.csv_path = os.path.join(self.args.output_dir, 'metrics.csv')
+
+    def _init_csv(self):
+        """Initialize CSV file — append if resuming, create if fresh."""
+        if self.start_epoch > 0 and os.path.exists(self.csv_path):
+            return  # resuming, CSV already has prior rows
+        with open(self.csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            writer.writeheader()
+
+    def _log_csv(self, row):
+        """Append one row to the CSV metrics log."""
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            writer.writerow({k: row.get(k, '') for k in CSV_COLUMNS})
+
     def resume_from_checkpoint(self, checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt['model'])
@@ -68,31 +93,30 @@ class Trainer:
     def save_checkpoint(self, epoch):
         os.makedirs(self.args.output_dir, exist_ok=True)
         path = os.path.join(self.args.output_dir, f'checkpoint_epoch{epoch}.pth')
-        torch.save({
+        state = {
             'epoch': epoch,
             'model': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'scaler': self.scaler.state_dict(),
-        }, path)
-        # Also save as latest
+        }
+        torch.save(state, path)
+        # Also save as latest (for easy resume)
         latest = os.path.join(self.args.output_dir, 'checkpoint_latest.pth')
-        torch.save({
-            'epoch': epoch,
-            'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'scaler': self.scaler.state_dict(),
-        }, latest)
+        torch.save(state, latest)
         print(f"Saved checkpoint: {path}")
 
     def train(self):
+        self._init_csv()
+
         for epoch in range(self.start_epoch, self.args.epochs):
+            t0 = time.time()
             self.scheduler.step(epoch)
             train_loss = self._train_one_epoch(epoch)
             val_acc1, val_acc5, val_loss = self._validate(epoch)
 
             lr = self.optimizer.param_groups[0]['lr']
+            epoch_time = time.time() - t0
 
             log_dict = {
                 'epoch': epoch,
@@ -101,6 +125,7 @@ class Trainer:
                 'val_acc1': val_acc1,
                 'val_acc5': val_acc5,
                 'lr': lr,
+                'epoch_time_s': round(epoch_time, 1),
             }
 
             # L2 norm analysis every N epochs
@@ -108,10 +133,14 @@ class Trainer:
                 norms_dict = self._run_analysis(epoch)
                 log_dict.update(norms_dict)
 
+            # Log to CSV (every epoch, persists to disk immediately)
+            self._log_csv(log_dict)
+
             if self.args.wandb:
                 wandb.log(log_dict, step=epoch)
 
-            # Checkpointing
+            # Checkpointing: every save_freq + always save latest
+            # On Colab/GCP, save_freq=25 is safer than 50 since sessions can die
             if (epoch + 1) % self.args.save_freq == 0 or epoch == self.args.epochs - 1:
                 self.save_checkpoint(epoch)
 
@@ -121,7 +150,8 @@ class Trainer:
                 f"val_loss={val_loss:.4f} | "
                 f"val_acc@1={val_acc1:.2f}% | "
                 f"val_acc@5={val_acc5:.2f}% | "
-                f"lr={lr:.6f}"
+                f"lr={lr:.6f} | "
+                f"time={epoch_time:.0f}s"
             )
 
     def _train_one_epoch(self, epoch):
@@ -196,8 +226,9 @@ class Trainer:
 
     @torch.no_grad()
     def _run_analysis(self, epoch):
-        """Run L2 norm analysis and optionally save visualizations."""
+        """Run L2 norm analysis — saves raw norms to .npy every epoch."""
         self.model.eval()
+        import numpy as np
 
         # Grab a batch from validation set
         images, _ = next(iter(self.val_loader))
@@ -211,27 +242,12 @@ class Trainer:
             'l2_outlier_ratio': outlier_ratio,
         }
 
-        # Save plots
         os.makedirs(self.args.output_dir, exist_ok=True)
 
-        fig_hist = plot_l2_distribution(norms, epoch)
-        hist_path = os.path.join(self.args.output_dir, f'l2_dist_epoch{epoch}.png')
-        fig_hist.savefig(hist_path, dpi=100, bbox_inches='tight')
-
-        if self.args.wandb:
-            wandb.log({f'l2_distribution': wandb.Image(hist_path)}, step=epoch)
-
-        import matplotlib.pyplot as plt
-        plt.close(fig_hist)
-
-        # Attention map visualization (first 4 images)
-        fig_attn = visualize_attention_maps(self.model, images[:4], epoch)
-        if fig_attn is not None:
-            attn_path = os.path.join(self.args.output_dir, f'attn_maps_epoch{epoch}.png')
-            fig_attn.savefig(attn_path, dpi=100, bbox_inches='tight')
-            if self.args.wandb:
-                wandb.log({f'attention_maps': wandb.Image(attn_path)}, step=epoch)
-            plt.close(fig_attn)
+        # Save raw L2 norms for custom figure generation later
+        norms_dir = os.path.join(self.args.output_dir, 'l2_norms')
+        os.makedirs(norms_dir, exist_ok=True)
+        np.save(os.path.join(norms_dir, f'epoch{epoch}.npy'), norms)
 
         print(f"  [Analysis] L2 mean={mean_norm:.2f}, std={std_norm:.2f}, outlier_ratio={outlier_ratio:.4f}")
         return log_dict

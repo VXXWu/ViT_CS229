@@ -16,7 +16,7 @@ def parse_args():
 
     # Model
     parser.add_argument('--model', type=str, default='vanilla',
-                        choices=['vanilla', 'register', 'gated'],
+                        choices=['vanilla', 'sdpa', 'register'],
                         help='Model variant')
     parser.add_argument('--num_classes', type=int, default=100)
     parser.add_argument('--drop_path', type=float, default=0.05)

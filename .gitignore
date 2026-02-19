@@ -1,3 +1,8 @@
 .DS_store
 output/
 data/
+archive/
+archive.zip
+imagenet100/
+imagenet100.tar
+modal_output/
