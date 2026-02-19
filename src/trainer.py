@@ -129,7 +129,11 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
 
-        for images, targets in self.train_loader:
+        # CHANGE THE I >= 20 AFTERWARDS
+        # for images, targets in self.train_loader:
+        for i, (images, targets) in enumerate(self.train_loader):
+            #if i >= 2:#REMOVE AFTER
+            #    break #REMOVE AFTER
             images = images.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
@@ -167,7 +171,10 @@ class Trainer:
 
         criterion_val = nn.CrossEntropyLoss()
 
-        for images, targets in self.val_loader:
+        # CHANGE THIS BACK TOO
+        for i, (images, targets) in enumerate(self.val_loader):
+            #if i >= 2:
+            #    break
             images = images.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 

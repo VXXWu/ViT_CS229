@@ -61,6 +61,10 @@ def parse_args():
     # Resume
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    
+    #added for experiment 2
+    parser.add_argument('--num_registers', type=int, default=0,
+                    help='Number of register tokens (0 = no registers)')
 
     args = parser.parse_args()
 
