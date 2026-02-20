@@ -7,14 +7,17 @@ Usage:
   # Upload ImageNet-100 tar to a Modal volume (one-time)
   modal volume put imagenet100-data /path/to/imagenet100.tar /imagenet100.tar
 
-  # Train SDPA ViT for 200 epochs on A100
-  modal run train_modal.py::train --model sdpa --epochs 200
+  # Train vanilla DeiT-III for 200 epochs on A100
+  modal run train_modal.py::train --model vanilla --epochs 200
+
+  # Train on H100 for faster throughput
+  modal run train_modal.py::train_fast --model vanilla --epochs 200
 
   # Resume to 800 epochs
-  modal run train_modal.py::train --model sdpa --epochs 800 --resume
+  modal run train_modal.py::train --model vanilla --epochs 800 --resume
 
   # Download results
-  modal volume get vit-checkpoints /sdpa/ ./modal_output/
+  modal volume get vit-checkpoints /vanilla/ ./modal_output/
 """
 
 import modal
@@ -40,23 +43,18 @@ image = (
     .add_local_dir("src", remote_path="/root/project/src")
 )
 
+VOLUME_MOUNTS = {"/data": data_volume, "/output": output_volume}
 
-@app.function(
-    image=image,
-    gpu="A100",
-    cpu=12,
-    volumes={
-        "/data": data_volume,
-        "/output": output_volume,
-    },
-    timeout=86400,
-)
-def train(
-    model: str = "sdpa",
-    epochs: int = 800,
-    batch_size: int = 256,
-    lr: float = 4e-3,
-    resume: bool = False,
+
+def _train_impl(
+    model: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    resume: bool,
+    suffix: str,
+    layer_scale_init: float,
+    num_workers: int = 10,
 ):
     import sys
     import os
@@ -114,7 +112,8 @@ def train(
     train_classes = os.listdir(train_dir)
     print(f"Data: {len(train_classes)} train classes")
 
-    output_dir = f"/output/{model}"
+    run_name = f"{model}_{suffix}" if suffix else model
+    output_dir = f"/output/{run_name}"
     os.makedirs(output_dir, exist_ok=True)
 
     args = SimpleNamespace(
@@ -123,7 +122,7 @@ def train(
         drop_path=0.05,
         data_path=data_path,
         batch_size=batch_size,
-        num_workers=10,
+        num_workers=num_workers,
         pin_memory=True,
         lr=lr,
         weight_decay=0.05,
@@ -139,11 +138,12 @@ def train(
         wandb=False,
         save_freq=25,
         analysis_freq=1,
+        layer_scale_init=layer_scale_init,
     )
 
     mdl = get_model(args)
     num_params = sum(p.numel() for p in mdl.parameters()) / 1e6
-    print(f"Model: {model} | Params: {num_params:.1f}M")
+    print(f"Model: {model} | Params: {num_params:.1f}M | LayerScale init: {layer_scale_init}")
 
     train_loader, val_loader = get_dataloaders(args)
     print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)}")
@@ -159,3 +159,35 @@ def train(
 
     output_volume.commit()
     print("Training complete! Checkpoints saved to volume 'vit-checkpoints'.")
+
+
+@app.function(
+    image=image, gpu="A100", cpu=12,
+    volumes=VOLUME_MOUNTS, timeout=86400,
+)
+def train(
+    model: str = "vanilla",
+    epochs: int = 200,
+    batch_size: int = 256,
+    lr: float = 4e-3,
+    resume: bool = False,
+    suffix: str = "",
+    layer_scale_init: float = 1e-4,
+):
+    _train_impl(model, epochs, batch_size, lr, resume, suffix, layer_scale_init)
+
+
+@app.function(
+    image=image, gpu="H100", cpu=20,
+    volumes=VOLUME_MOUNTS, timeout=86400,
+)
+def train_fast(
+    model: str = "vanilla",
+    epochs: int = 200,
+    batch_size: int = 256,
+    lr: float = 4e-3,
+    resume: bool = False,
+    suffix: str = "",
+    layer_scale_init: float = 1e-4,
+):
+    _train_impl(model, epochs, batch_size, lr, resume, suffix, layer_scale_init, num_workers=16)

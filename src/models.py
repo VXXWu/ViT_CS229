@@ -669,26 +669,31 @@ class ValueGatedViT(nn.Module):
 
 def get_model(args):
     """Factory function to create models by name."""
+    ls_init = getattr(args, 'layer_scale_init', 1e-4)
     if args.model == 'vanilla':
         return VanillaViT(
             num_classes=args.num_classes,
             drop_path_rate=args.drop_path,
+            layer_scale_init=ls_init,
         )
     elif args.model == 'register':
         return RegisterViT(
             num_classes=args.num_classes,
             drop_path_rate=args.drop_path,
             num_register_tokens=getattr(args, 'num_register_tokens', 4),
+            layer_scale_init=ls_init,
         )
     elif args.model == 'sdpa_gated':
         return SDPAGatedViT(
             num_classes=args.num_classes,
             drop_path_rate=args.drop_path,
+            layer_scale_init=ls_init,
         )
     elif args.model == 'value_gated':
         return ValueGatedViT(
             num_classes=args.num_classes,
             drop_path_rate=args.drop_path,
+            layer_scale_init=ls_init,
         )
     else:
         raise ValueError(
