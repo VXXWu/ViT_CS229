@@ -1,15 +1,28 @@
-"""Model definitions for ViT experiments."""
+"""Model definitions for ViT experiments (DeiT-III architecture)."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
 from timm.layers import DropPath
 
 
 # =============================================================================
-# Custom ViT with PyTorch Scaled Dot-Product Attention (SDPA)
+# Shared components
 # =============================================================================
+
+class LayerScale(nn.Module):
+    """Per-channel learnable scaling on residual branches (Touvron et al., 2021).
+
+    DeiT-III uses init_values=1e-5 for ViT-Small.
+    """
+
+    def __init__(self, dim, init_values=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+
+    def forward(self, x):
+        return x * self.gamma
+
 
 class SDPAttention(nn.Module):
     """Multi-head self-attention using F.scaled_dot_product_attention."""
@@ -29,7 +42,6 @@ class SDPAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, head_dim)
         q, k, v = qkv.unbind(0)
 
-        # PyTorch native SDPA — uses FlashAttention or Memory-Efficient kernels on CUDA
         x = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.attn_drop if self.training else 0.,
@@ -59,22 +71,6 @@ class MLP(nn.Module):
         return x
 
 
-class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True,
-                 drop=0., attn_drop=0., drop_path=0.):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = SDPAttention(dim, num_heads, qkv_bias, attn_drop, drop)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, mlp_ratio, drop)
-
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
-
-
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=384):
         super().__init__()
@@ -82,46 +78,191 @@ class PatchEmbed(nn.Module):
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
-        # (B, C, H, W) -> (B, num_patches, embed_dim)
         x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)
         return x
 
 
-class SDPViT(nn.Module):
-    """Vision Transformer with PyTorch native scaled dot-product attention.
+# =============================================================================
+# Blocks (DeiT-III: pre-norm + LayerScale)
+# =============================================================================
+
+class Block(nn.Module):
+    """Standard DeiT-III transformer block with LayerScale."""
+
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True,
+                 drop=0., attn_drop=0., drop_path=0., layer_scale_init=1e-5):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = SDPAttention(dim, num_heads, qkv_bias, attn_drop, drop)
+        self.ls1 = LayerScale(dim, layer_scale_init)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, mlp_ratio, drop)
+        self.ls2 = LayerScale(dim, layer_scale_init)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.ls1(self.attn(self.norm1(x))))
+        x = x + self.drop_path(self.ls2(self.mlp(self.norm2(x))))
+        return x
+
+
+class SDPAGatedBlock(nn.Module):
+    """DeiT-III block with SDPA output gating (G1) and LayerScale."""
+
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True,
+                 drop=0., attn_drop=0., drop_path=0., layer_scale_init=1e-5):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = SDPAGatedAttention(dim, num_heads, qkv_bias, attn_drop, drop)
+        self.ls1 = LayerScale(dim, layer_scale_init)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, mlp_ratio, drop)
+        self.ls2 = LayerScale(dim, layer_scale_init)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.ls1(self.attn(self.norm1(x))))
+        x = x + self.drop_path(self.ls2(self.mlp(self.norm2(x))))
+        return x
+
+
+class ValueGatedBlock(nn.Module):
+    """DeiT-III block with value gating (G2) and LayerScale."""
+
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True,
+                 drop=0., attn_drop=0., drop_path=0., layer_scale_init=1e-5):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = ValueGatedAttention(dim, num_heads, qkv_bias, attn_drop, drop)
+        self.ls1 = LayerScale(dim, layer_scale_init)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, mlp_ratio, drop)
+        self.ls2 = LayerScale(dim, layer_scale_init)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.ls1(self.attn(self.norm1(x))))
+        x = x + self.drop_path(self.ls2(self.mlp(self.norm2(x))))
+        return x
+
+
+# =============================================================================
+# Gated attention modules (Qiu et al. 2025)
+# =============================================================================
+
+class SDPAGatedAttention(nn.Module):
+    """Multi-head self-attention with sigmoid gate after SDPA (G1 position).
+
+    Implements Eq. 5 from Qiu et al. 2025: Y' = Y . sigma(X W_theta)
+    where Y = SDPA output and X = pre-normalized hidden states.
+    Gate is query-dependent: each token's gate score depends on its own
+    hidden state X_i, introducing non-linearity between W_V and W_O
+    (Eq. 8) and input-dependent sparsity.
+    """
+
+    def __init__(self, dim, num_heads=6, qkv_bias=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+        self.attn_drop = attn_drop
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.gate = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_drop if self.training else 0.,
+        )
+
+        gate = torch.sigmoid(self.gate(x))
+        gate = gate.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        attn_out = attn_out * gate
+
+        x = attn_out.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class ValueGatedAttention(nn.Module):
+    """Multi-head self-attention with sigmoid gate after value projection (G2).
+
+    Implements Eq. 5 at G2 position: V' = V . sigma(X W_theta)
+    where V = X W_V and X = pre-normalized hidden states.
+    Gate is NOT query-dependent: each token j's gate depends on X_j (Eq. 7).
+    """
+
+    def __init__(self, dim, num_heads=6, qkv_bias=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+        self.attn_drop = attn_drop
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.gate = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        gate = torch.sigmoid(self.gate(x))
+        gate = gate.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v * gate
+
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_drop if self.training else 0.,
+        )
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+# =============================================================================
+# Baseline DeiT-III ViT-Small
+# =============================================================================
+
+class VanillaViT(nn.Module):
+    """DeiT-III ViT-Small baseline.
 
     ViT-Small config: embed_dim=384, depth=12, num_heads=6, patch_size=16.
-    Uses F.scaled_dot_product_attention for fused FlashAttention/MemEfficient
-    kernels on CUDA — ~2x faster and ~0.5x memory vs manual attention.
+    Includes LayerScale (init=1e-5) on both attention and MLP residuals.
     """
 
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=100,
                  embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.,
                  qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0.05):
+                 drop_path_rate=0.05, layer_scale_init=1e-5):
         super().__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.depth = depth
         self.num_heads = num_heads
 
-        # Patch embedding
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        # CLS token + positional embedding
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(drop_rate)
 
-        # Stochastic depth decay
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-
-        # Transformer blocks
         self.blocks = nn.Sequential(*[
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias,
-                  drop_rate, attn_drop_rate, dpr[i])
+                  drop_rate, attn_drop_rate, dpr[i], layer_scale_init)
             for i in range(depth)
         ])
 
@@ -154,19 +295,13 @@ class SDPViT(nn.Module):
 
     def forward(self, x):
         x = self.forward_features(x)
-        return self.head(x[:, 0])  # CLS token
+        return self.head(x[:, 0])
 
     def get_patch_tokens(self, x):
-        """Extract patch tokens (excluding CLS) from the final layer."""
         features = self.forward_features(x)
         return features[:, 1:, :]
 
     def get_attention_maps(self, x):
-        """Compute attention maps for each layer.
-
-        Since SDPA doesn't return attention weights, we recompute Q*K^T
-        manually from each block's qkv projection for analysis only.
-        """
         B = x.shape[0]
         x = self.patch_embed(x)
         cls = self.cls_token.expand(B, -1, -1)
@@ -175,7 +310,6 @@ class SDPViT(nn.Module):
 
         attention_maps = []
         for block in self.blocks:
-            # Recompute attention weights from pre-norm input
             normed = block.norm1(x)
             BN, N, C = normed.shape
             qkv = block.attn.qkv(normed).reshape(BN, N, 3, block.attn.num_heads, block.attn.head_dim)
@@ -184,24 +318,22 @@ class SDPViT(nn.Module):
             attn = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
             attn = attn.softmax(dim=-1)
             attention_maps.append(attn.detach().cpu())
-
-            # Run the actual block forward
             x = block(x)
 
         return attention_maps
 
 
 # =============================================================================
-# Register ViT (SDPA + learnable register tokens)
+# Register ViT (DeiT-III + learnable register tokens)
 # =============================================================================
 
 class RegisterViT(nn.Module):
-    """Vision Transformer with register tokens (Darcet et al., 2023).
+    """DeiT-III ViT-Small with register tokens (Darcet et al., 2024).
 
-    Identical to SDPViT but adds k learnable register tokens that participate
-    in attention alongside CLS and patch tokens. Register tokens are discarded
-    before the classification head. They absorb high-norm artifacts that would
-    otherwise appear in patch tokens.
+    Adds k learnable register tokens that participate in attention alongside
+    CLS and patch tokens. Register tokens are discarded before the
+    classification head. They absorb high-norm artifacts that would otherwise
+    appear in patch tokens.
 
     Token layout: [CLS, register_1, ..., register_k, patch_1, ..., patch_196]
     """
@@ -209,7 +341,8 @@ class RegisterViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=100,
                  embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.,
                  qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0.05, num_register_tokens=4):
+                 drop_path_rate=0.05, layer_scale_init=1e-5,
+                 num_register_tokens=4):
         super().__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
@@ -217,24 +350,18 @@ class RegisterViT(nn.Module):
         self.num_heads = num_heads
         self.num_register_tokens = num_register_tokens
 
-        # Patch embedding
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        # CLS token + register tokens + positional embedding
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, embed_dim))
-        # Positional embedding covers CLS + patches only (registers have no position)
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(drop_rate)
 
-        # Stochastic depth decay
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-
-        # Transformer blocks (same as SDPViT)
         self.blocks = nn.Sequential(*[
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias,
-                  drop_rate, attn_drop_rate, dpr[i])
+                  drop_rate, attn_drop_rate, dpr[i], layer_scale_init)
             for i in range(depth)
         ])
 
@@ -260,12 +387,11 @@ class RegisterViT(nn.Module):
         B = x.shape[0]
         x = self.patch_embed(x)
         cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1)              # [CLS, patches]
-        x = self.pos_drop(x + self.pos_embed)        # positional embed on CLS + patches
+        x = torch.cat([cls, x], dim=1)
+        x = self.pos_drop(x + self.pos_embed)
 
-        # Insert register tokens after CLS (no positional embedding for registers)
         reg = self.register_tokens.expand(B, -1, -1)
-        x = torch.cat([x[:, :1], reg, x[:, 1:]], dim=1)  # [CLS, reg_1..k, patches]
+        x = torch.cat([x[:, :1], reg, x[:, 1:]], dim=1)
 
         x = self.blocks(x)
         x = self.norm(x)
@@ -273,20 +399,17 @@ class RegisterViT(nn.Module):
 
     def forward(self, x):
         x = self.forward_features(x)
-        return self.head(x[:, 0])  # CLS token
+        return self.head(x[:, 0])
 
     def get_patch_tokens(self, x):
-        """Extract patch tokens (excluding CLS and register tokens)."""
         features = self.forward_features(x)
         return features[:, 1 + self.num_register_tokens:, :]
 
     def get_register_tokens(self, x):
-        """Extract register tokens for analysis."""
         features = self.forward_features(x)
         return features[:, 1:1 + self.num_register_tokens, :]
 
     def get_attention_maps(self, x):
-        """Compute attention maps for each layer (includes register tokens)."""
         B = x.shape[0]
         x = self.patch_embed(x)
         cls = self.cls_token.expand(B, -1, -1)
@@ -306,69 +429,238 @@ class RegisterViT(nn.Module):
             attn = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
             attn = attn.softmax(dim=-1)
             attention_maps.append(attn.detach().cpu())
-
             x = block(x)
 
         return attention_maps
 
 
 # =============================================================================
-# Vanilla ViT (timm DeiT-III wrapper, kept for comparison)
+# SDPA-Gated ViT (DeiT-III + G1 gate after SDPA output)
+# Qiu et al. 2025
 # =============================================================================
 
-class VanillaViT(nn.Module):
-    """Thin wrapper around DeiT-III Small for ImageNet-100."""
+class SDPAGatedViT(nn.Module):
+    """DeiT-III ViT-Small with sigmoid gate after SDPA output (G1).
 
-    def __init__(self, num_classes=100, drop_path_rate=0.05):
+    Each attention layer applies a head-specific elementwise sigmoid gate
+    to the SDPA output before the output projection. The gate score is
+    query-dependent: sigma(X_i W_theta) for token i (Eq. 8). This breaks
+    the low-rank bottleneck between W_V and W_O, introduces input-dependent
+    sparsity, and mitigates attention sinks.
+
+    Added params: dim x dim per layer (no bias) = 384x384x12 ~ 1.77M for ViT-S.
+    """
+
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=100,
+                 embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.,
+                 qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
+                 drop_path_rate=0.05, layer_scale_init=1e-5):
         super().__init__()
-        self.model = timm.create_model(
-            'deit3_small_patch16_224',
-            pretrained=False,
-            num_classes=num_classes,
-            drop_path_rate=drop_path_rate,
-        )
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.depth = depth
+        self.num_heads = num_heads
+
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_drop = nn.Dropout(drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.blocks = nn.Sequential(*[
+            SDPAGatedBlock(embed_dim, num_heads, mlp_ratio, qkv_bias,
+                           drop_rate, attn_drop_rate, dpr[i], layer_scale_init)
+            for i in range(depth)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward_features(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return x
 
     def forward(self, x):
-        return self.model(x)
+        x = self.forward_features(x)
+        return self.head(x[:, 0])
 
     def get_patch_tokens(self, x):
-        """Extract patch tokens (excluding CLS) from the final layer."""
-        features = self.model.forward_features(x)
-        patch_tokens = features[:, 1:, :]
-        return patch_tokens
+        features = self.forward_features(x)
+        return features[:, 1:, :]
 
     def get_attention_maps(self, x):
-        """Get CLS-to-patch attention maps for each layer via forward hooks."""
+        B = x.shape[0]
+        x = self.patch_embed(x)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+
         attention_maps = []
-        hooks = []
-
-        for block in self.model.blocks:
-            storage = []
-            attention_maps.append(storage)
-            h = block.attn.register_forward_hook(self._make_attn_hook(storage))
-            hooks.append(h)
-
-        with torch.no_grad():
-            self.model(x)
-
-        for h in hooks:
-            h.remove()
-
-        maps = [s[0] for s in attention_maps if len(s) > 0]
-        return maps
-
-    @staticmethod
-    def _make_attn_hook(storage):
-        def hook_fn(module, input, output):
-            x = input[0]
-            B, N, C = x.shape
-            qkv = module.qkv(x).reshape(B, N, 3, module.num_heads, C // module.num_heads)
+        for block in self.blocks:
+            normed = block.norm1(x)
+            BN, N, C = normed.shape
+            qkv = block.attn.qkv(normed).reshape(BN, N, 3, block.attn.num_heads, block.attn.head_dim)
             qkv = qkv.permute(2, 0, 3, 1, 4)
             q, k, _ = qkv.unbind(0)
             attn = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
             attn = attn.softmax(dim=-1)
-            storage.append(attn.detach().cpu())
-        return hook_fn
+            attention_maps.append(attn.detach().cpu())
+            x = block(x)
+
+        return attention_maps
+
+    def get_gate_scores(self, x):
+        """Extract per-layer gate scores sigma(X W_theta) for analysis."""
+        B = x.shape[0]
+        x = self.patch_embed(x)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+
+        gate_scores = []
+        for block in self.blocks:
+            normed = block.norm1(x)
+            g = torch.sigmoid(block.attn.gate(normed))
+            gate_scores.append(g.detach().cpu())
+            x = block(x)
+
+        return gate_scores
+
+
+# =============================================================================
+# Value-Gated ViT (DeiT-III + G2 gate after value projection)
+# Qiu et al. 2025
+# =============================================================================
+
+class ValueGatedViT(nn.Module):
+    """DeiT-III ViT-Small with sigmoid gate after value projection (G2).
+
+    Each attention layer applies a head-specific elementwise sigmoid gate
+    to the value vectors before SDPA. The gate score depends on X_j (the
+    token being attended to), not the query (Eq. 7). This introduces
+    non-linearity but produces higher (less sparse) gate scores than G1.
+
+    Added params: dim x dim per layer (no bias) = 384x384x12 ~ 1.77M for ViT-S.
+    """
+
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=100,
+                 embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.,
+                 qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
+                 drop_path_rate=0.05, layer_scale_init=1e-5):
+        super().__init__()
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.depth = depth
+        self.num_heads = num_heads
+
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_drop = nn.Dropout(drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.blocks = nn.Sequential(*[
+            ValueGatedBlock(embed_dim, num_heads, mlp_ratio, qkv_bias,
+                            drop_rate, attn_drop_rate, dpr[i], layer_scale_init)
+            for i in range(depth)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward_features(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return x
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        return self.head(x[:, 0])
+
+    def get_patch_tokens(self, x):
+        features = self.forward_features(x)
+        return features[:, 1:, :]
+
+    def get_attention_maps(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+
+        attention_maps = []
+        for block in self.blocks:
+            normed = block.norm1(x)
+            BN, N, C = normed.shape
+            qkv = block.attn.qkv(normed).reshape(BN, N, 3, block.attn.num_heads, block.attn.head_dim)
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+            q, k, _ = qkv.unbind(0)
+            attn = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+            attn = attn.softmax(dim=-1)
+            attention_maps.append(attn.detach().cpu())
+            x = block(x)
+
+        return attention_maps
+
+    def get_gate_scores(self, x):
+        """Extract per-layer gate scores sigma(X W_theta) for analysis."""
+        B = x.shape[0]
+        x = self.patch_embed(x)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+
+        gate_scores = []
+        for block in self.blocks:
+            normed = block.norm1(x)
+            g = torch.sigmoid(block.attn.gate(normed))
+            gate_scores.append(g.detach().cpu())
+            x = block(x)
+
+        return gate_scores
 
 
 # =============================================================================
@@ -382,16 +674,24 @@ def get_model(args):
             num_classes=args.num_classes,
             drop_path_rate=args.drop_path,
         )
-    elif args.model == 'sdpa':
-        return SDPViT(
-            num_classes=args.num_classes,
-            drop_path_rate=args.drop_path,
-        )
     elif args.model == 'register':
         return RegisterViT(
             num_classes=args.num_classes,
             drop_path_rate=args.drop_path,
             num_register_tokens=getattr(args, 'num_register_tokens', 4),
         )
+    elif args.model == 'sdpa_gated':
+        return SDPAGatedViT(
+            num_classes=args.num_classes,
+            drop_path_rate=args.drop_path,
+        )
+    elif args.model == 'value_gated':
+        return ValueGatedViT(
+            num_classes=args.num_classes,
+            drop_path_rate=args.drop_path,
+        )
     else:
-        raise ValueError(f"Unknown model: {args.model}. Available: vanilla, sdpa, register")
+        raise ValueError(
+            f"Unknown model: {args.model}. "
+            "Available: vanilla, register, sdpa_gated, value_gated"
+        )
