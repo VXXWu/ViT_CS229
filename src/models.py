@@ -13,10 +13,10 @@ from timm.layers import DropPath
 class LayerScale(nn.Module):
     """Per-channel learnable scaling on residual branches (Touvron et al., 2021).
 
-    DeiT-III uses init_values=1e-5 for ViT-Small.
+    DeiT-III uses init_values=1e-4 for ViT-Small.
     """
 
-    def __init__(self, dim, init_values=1e-5):
+    def __init__(self, dim, init_values=1e-4):
         super().__init__()
         self.gamma = nn.Parameter(init_values * torch.ones(dim))
 
@@ -91,7 +91,7 @@ class Block(nn.Module):
     """Standard DeiT-III transformer block with LayerScale."""
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True,
-                 drop=0., attn_drop=0., drop_path=0., layer_scale_init=1e-5):
+                 drop=0., attn_drop=0., drop_path=0., layer_scale_init=1e-4):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = SDPAttention(dim, num_heads, qkv_bias, attn_drop, drop)
@@ -111,7 +111,7 @@ class SDPAGatedBlock(nn.Module):
     """DeiT-III block with SDPA output gating (G1) and LayerScale."""
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True,
-                 drop=0., attn_drop=0., drop_path=0., layer_scale_init=1e-5):
+                 drop=0., attn_drop=0., drop_path=0., layer_scale_init=1e-4):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = SDPAGatedAttention(dim, num_heads, qkv_bias, attn_drop, drop)
@@ -131,7 +131,7 @@ class ValueGatedBlock(nn.Module):
     """DeiT-III block with value gating (G2) and LayerScale."""
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True,
-                 drop=0., attn_drop=0., drop_path=0., layer_scale_init=1e-5):
+                 drop=0., attn_drop=0., drop_path=0., layer_scale_init=1e-4):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = ValueGatedAttention(dim, num_heads, qkv_bias, attn_drop, drop)
@@ -239,13 +239,13 @@ class VanillaViT(nn.Module):
     """DeiT-III ViT-Small baseline.
 
     ViT-Small config: embed_dim=384, depth=12, num_heads=6, patch_size=16.
-    Includes LayerScale (init=1e-5) on both attention and MLP residuals.
+    Includes LayerScale (init=1e-4) on both attention and MLP residuals.
     """
 
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=100,
                  embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.,
                  qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0.05, layer_scale_init=1e-5):
+                 drop_path_rate=0.05, layer_scale_init=1e-4):
         super().__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
@@ -341,7 +341,7 @@ class RegisterViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=100,
                  embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.,
                  qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0.05, layer_scale_init=1e-5,
+                 drop_path_rate=0.05, layer_scale_init=1e-4,
                  num_register_tokens=4):
         super().__init__()
         self.num_classes = num_classes
@@ -454,7 +454,7 @@ class SDPAGatedViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=100,
                  embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.,
                  qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0.05, layer_scale_init=1e-5):
+                 drop_path_rate=0.05, layer_scale_init=1e-4):
         super().__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
@@ -568,7 +568,7 @@ class ValueGatedViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=100,
                  embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.,
                  qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0.05, layer_scale_init=1e-5):
+                 drop_path_rate=0.05, layer_scale_init=1e-4):
         super().__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
