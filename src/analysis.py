@@ -1,90 +1,127 @@
-"""L2 norm tracking and attention map visualization."""
+"""CKA and representation analysis across attention mechanism variants."""
 
-import torch
+import json
+import os
+
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+import torch
 
 
-@torch.no_grad()
-def compute_l2_norms(model, images):
-    """Compute per-token L2 norms from patch tokens.
+def linear_cka(X, Y):
+    """Compute linear CKA between two representation matrices.
+
+    Args:
+        X: (n, p1) tensor
+        Y: (n, p2) tensor
 
     Returns:
-        norms: (B*num_patches,) numpy array of L2 norms
-        outlier_ratio: fraction of tokens with norm > mean + 3*std
-        mean_norm: mean of all token norms
-        std_norm: std of all token norms
+        CKA similarity score in [0, 1]
     """
-    patch_tokens = model.get_patch_tokens(images)  # (B, num_patches, D)
-    norms = torch.norm(patch_tokens, dim=-1).cpu().numpy().flatten()
+    X = X - X.mean(dim=0, keepdim=True)
+    Y = Y - Y.mean(dim=0, keepdim=True)
 
-    mean_norm = float(norms.mean())
-    std_norm = float(norms.std())
-    threshold = mean_norm + 3 * std_norm
-    outlier_ratio = float((norms > threshold).sum() / len(norms))
+    hsic_xy = (X @ X.T * (Y @ Y.T)).sum()
+    hsic_xx = (X @ X.T * (X @ X.T)).sum()
+    hsic_yy = (Y @ Y.T * (Y @ Y.T)).sum()
 
-    return norms, outlier_ratio, mean_norm, std_norm
-
-
-def plot_l2_distribution(norms, epoch):
-    """Plot histogram of L2 norms."""
-    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    ax.hist(norms, bins=100, alpha=0.7, color='steelblue', edgecolor='black', linewidth=0.5)
-
-    mean = norms.mean()
-    std = norms.std()
-    ax.axvline(mean, color='red', linestyle='--', label=f'Mean={mean:.2f}')
-    ax.axvline(mean + 3 * std, color='orange', linestyle='--', label=f'Mean+3σ={mean + 3*std:.2f}')
-
-    ax.set_xlabel('L2 Norm')
-    ax.set_ylabel('Count')
-    ax.set_title(f'Patch Token L2 Norm Distribution (Epoch {epoch})')
-    ax.legend()
-
-    return fig
+    return float(hsic_xy / (torch.sqrt(hsic_xx * hsic_yy) + 1e-10))
 
 
-@torch.no_grad()
-def visualize_attention_maps(model, images, epoch, num_images=4):
-    """Visualize CLS→patch attention heatmaps per layer.
+def compute_pairwise_cka(features_dict, layer_idx=-1, feature_type='cls'):
+    """Compute pairwise CKA between all model variants at a specific layer.
 
-    Returns a matplotlib figure with a grid: rows=images, cols=layers.
+    Args:
+        features_dict: {model_name: {'cls': [tensors], 'patch': [tensors]}}
+        layer_idx: which layer to compare (-1 = last / post-norm)
+        feature_type: 'cls' or 'patch'
+
+    Returns:
+        names: list of model names
+        cka_matrix: (N, N) numpy array
     """
-    images = images[:num_images]
-    attention_maps = model.get_attention_maps(images)
+    names = sorted(features_dict.keys())
+    n = len(names)
+    cka_matrix = np.ones((n, n))
 
-    if not attention_maps:
-        return None
+    for i in range(n):
+        for j in range(i + 1, n):
+            X = features_dict[names[i]][feature_type][layer_idx].float()
+            Y = features_dict[names[j]][feature_type][layer_idx].float()
+            # Use same number of samples
+            min_n = min(X.shape[0], Y.shape[0])
+            cka = linear_cka(X[:min_n], Y[:min_n])
+            cka_matrix[i, j] = cka
+            cka_matrix[j, i] = cka
 
-    num_layers = len(attention_maps)
-    num_imgs = images.shape[0]
+    return names, cka_matrix
 
-    # Compute number of patches per side
-    num_patches = attention_maps[0].shape[-1] - 1  # exclude CLS
-    h = w = int(num_patches ** 0.5)
 
-    fig, axes = plt.subplots(num_imgs, num_layers, figsize=(2.5 * num_layers, 2.5 * num_imgs))
-    if num_imgs == 1:
-        axes = axes[np.newaxis, :]
-    if num_layers == 1:
-        axes = axes[:, np.newaxis]
+def compute_layerwise_cka(features_a, features_b, feature_type='cls'):
+    """Compute CKA between two models at every layer pair.
 
-    for img_idx in range(num_imgs):
-        for layer_idx in range(num_layers):
-            attn = attention_maps[layer_idx]  # (B, heads, N, N)
-            # Average over heads, take CLS row (row 0), exclude CLS column
-            cls_attn = attn[img_idx].mean(dim=0)[0, 1:]  # (num_patches,)
-            cls_attn = cls_attn.reshape(h, w).numpy()
+    Args:
+        features_a: {'cls': [tensors], 'patch': [tensors]}
+        features_b: {'cls': [tensors], 'patch': [tensors]}
+        feature_type: 'cls' or 'patch'
 
-            ax = axes[img_idx, layer_idx]
-            ax.imshow(cls_attn, cmap='viridis')
-            ax.set_xticks([])
-            ax.set_yticks([])
-            if img_idx == 0:
-                ax.set_title(f'Layer {layer_idx}', fontsize=8)
+    Returns:
+        cka_grid: (L_a, L_b) numpy array where L is num_layers + 1 (includes post-norm)
+    """
+    feats_a = features_a[feature_type]
+    feats_b = features_b[feature_type]
+    La, Lb = len(feats_a), len(feats_b)
+    cka_grid = np.zeros((La, Lb))
 
-    fig.suptitle(f'CLS→Patch Attention Maps (Epoch {epoch})', fontsize=12)
-    fig.tight_layout()
-    return fig
+    for i in range(La):
+        for j in range(Lb):
+            X = feats_a[i].float()
+            Y = feats_b[j].float()
+            min_n = min(X.shape[0], Y.shape[0])
+            cka_grid[i, j] = linear_cka(X[:min_n], Y[:min_n])
+
+    return cka_grid
+
+
+def load_features(results_dir, model_names, epoch='final'):
+    """Load saved features from all model runs.
+
+    Args:
+        results_dir: path containing per-model subdirectories
+        model_names: list of model run directory names
+        epoch: 'final' to use last available, or int for specific epoch
+
+    Returns:
+        features_dict: {model_name: {'cls': [tensors], 'patch': [tensors]}}
+    """
+    features_dict = {}
+    for name in model_names:
+        feat_dir = os.path.join(results_dir, name, 'features')
+        if not os.path.isdir(feat_dir):
+            print(f"WARNING: No features dir for {name}")
+            continue
+
+        # Find the feature file
+        if epoch == 'final':
+            files = [f for f in os.listdir(feat_dir) if f.endswith('.pt')]
+            if not files:
+                print(f"WARNING: No feature files for {name}")
+                continue
+            # Sort numerically by epoch number
+            files.sort(key=lambda f: int(''.join(c for c in f if c.isdigit()) or '0'))
+            path = os.path.join(feat_dir, files[-1])
+        else:
+            path = os.path.join(feat_dir, f'epoch{epoch}.pt')
+
+        if not os.path.exists(path):
+            print(f"WARNING: {path} not found")
+            continue
+
+        data = torch.load(path, map_location='cpu', weights_only=False)
+        features_dict[name] = {
+            'cls': data['cls'],
+            'patch': data['patch'],
+        }
+        print(f"Loaded {name}: {len(data['cls'])} layers, "
+              f"{data['cls'][0].shape[0]} samples")
+
+    return features_dict

@@ -1,8 +1,22 @@
 .DS_store
-output/
+__pycache__/
+venv/
+/.claude
+
+# Data (too large for git)
 data/
 archive/
 archive.zip
 imagenet100/
 imagenet100.tar
-modal_output/
+
+# Old/abandoned code
+old/
+notes/
+
+# Results: exclude large files, keep small analysis outputs
+results/
+results.zip
+
+
+# Keep: metrics.csv, attn_entropy/, l2_norms/, config.json (small, needed for plots)
